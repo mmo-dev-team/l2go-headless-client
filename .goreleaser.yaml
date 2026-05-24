@@ -1,0 +1,59 @@
+# .goreleaser.yaml
+# Documentation at https://goreleaser.com
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+    main: ./cmd/main.go
+    binary: l2go-headless-client
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_x86_64
+    format_overrides:
+      - goos: windows
+        format: zip
+
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'README'
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*!?:.+$"
+      order: 0
+    - title: 'Bug fixes'
+      regexp: "^.*fix[(\\w)]*!?:.+$"
+      order: 1
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: mmo-dev-team
+    name: l2go-headless-client
+  draft: false
+  prerelease: auto
+  name_template: "Release {{.Tag}}"
