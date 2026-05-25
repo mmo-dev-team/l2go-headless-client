@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/mmo-dev-team/l2go-headless-client/internal/crypto"
@@ -36,37 +37,37 @@ const (
 
 // Client is a high-performance headless Lineage 2 client.
 type Client struct {
-	addr       string
-	account    string
-	password   string
-	staticKey  []byte
-	conn       net.Conn
-	reader     *l2net.Reader
-	writer     *l2net.Writer
-	crypt      *crypto.Crypt
-	rsa        *crypto.RSA
-	log        *logger.Logger
-	sessionID  uint32
-	loginKey1  uint32
-	loginKey2  uint32
-	playKey1   uint32
-	playKey2   uint32
-	Servers    []l2net.GameServer
-	State      State
-	objectId   uint32
-	classId    uint32
-	x          int32
-	y          int32
-	z          int32
-	inventory  []uint32
-	npcs       []uint32
-	attackChan chan struct{}
-
-	// Game Server members
-	gsConn   net.Conn
-	gsReader *l2net.Reader
-	gsWriter *l2net.Writer
-	gsCrypt  crypto.GameCrypt
+	staticKey     []byte
+	Servers       []l2net.GameServer
+	inventory     []uint32
+	npcs          []uint32
+	conn          net.Conn
+	gsConn        net.Conn
+	reader        *l2net.Reader
+	writer        *l2net.Writer
+	crypt         *crypto.Crypt
+	rsa           *crypto.RSA
+	log           *logger.Logger
+	attackChan    chan struct{}
+	gsReader      *l2net.Reader
+	gsWriter      *l2net.Writer
+	State         State
+	addr          string
+	account       string
+	password      string
+	sessionID     uint32
+	loginKey1     uint32
+	loginKey2     uint32
+	playKey1      uint32
+	playKey2      uint32
+	objectId      uint32
+	classId       uint32
+	x             int32
+	y             int32
+	z             int32
+	pendingAppear atomic.Bool
+	dead          atomic.Bool
+	gsCrypt       crypto.GameCrypt
 }
 
 // NewClient creates a new headless client instance.
@@ -520,18 +521,52 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 			"Human Fighter rocks!",
 		}
 		chatChannels := []int32{0, 1, 8} // General, Shout, Trade
+		deathTaunts := []string{
+			"brb respawn, you're finished!",
+			"I'll be right back and you're done",
+			"lucky hit, wait till I return",
+			"see you at the res point, then it's over",
+		}
 
 		// Persistent roam heading so successive moves accumulate in one direction
 		// (the bot genuinely travels far) instead of cancelling out as a random walk.
 		roamAngle := rng.Float64() * 2 * math.Pi
 
 		for {
+			// After a teleport, ack with C_APPEARING so the server clears
+			// IsTeleporting (else movement/ValidatePosition are ignored).
+			if c.pendingAppear.CompareAndSwap(true, false) {
+				payload := c.gsWriter.Prepare(4)
+				size := l2net.EncodeGSAppearingTo(payload)
+				c.gsCrypt.Encrypt(payload[:size])
+				if err := c.gsWriter.Send(size); err != nil {
+					return
+				}
+				c.log.Log(c.account, "Teleported → sent Appearing")
+			}
+
 			// Wait for delay or context cancellation
 			delay := time.Second * time.Duration(rng.Intn(2)+1)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(delay):
+			}
+
+			// Dead bots cannot act (the server rejects target/attack on the dead) —
+			// they only taunt in chat, then wait. Models a killed player shouting.
+			if c.dead.Load() {
+				if rng.Intn(3) == 0 {
+					phrase := deathTaunts[rng.Intn(len(deathTaunts))]
+					payload := c.gsWriter.Prepare(256)
+					size := l2net.EncodeGSSay2To(phrase, 0, payload)
+					c.logPacket("C2S", "GS:Say2", payload[:size])
+					c.gsCrypt.Encrypt(payload[:size])
+					if err := c.gsWriter.Send(size); err != nil {
+						return
+					}
+				}
+				continue
 			}
 
 			// Randomly choose action: 0 = Move, 1 = Social Action, 2 = Use Item, 3 = Attack, 4 = Chat Spam
@@ -721,8 +756,23 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 				continue
 			}
 
-			// Intercept ItemList to find equippable items
-			if data[0] == l2net.OpGSItemList {
+			// Teleport: update local position
+			if data[0] == l2net.OpGSTeleportToLocation {
+				if len(data) >= 17 { // body: objectId, x@[5:9], y@[9:13], z@[13:17], ...
+					c.x = int32(binary.LittleEndian.Uint32(data[5:9]))
+					c.y = int32(binary.LittleEndian.Uint32(data[9:13]))
+					c.z = int32(binary.LittleEndian.Uint32(data[13:17]))
+				}
+				c.logPacket("S2C", "GS:TeleportToLocation", data)
+				c.pendingAppear.Store(true)
+			} else if data[0] == l2net.OpGSDie {
+				if len(data) >= 5 && binary.LittleEndian.Uint32(data[1:5]) == c.objectId {
+					c.dead.Store(true)
+					c.log.Log(c.account, "DIED — cannot act, only chat")
+				}
+				c.logPacket("S2C", "GS:Die", data)
+				// Intercept ItemList to find equippable items
+			} else if data[0] == l2net.OpGSItemList {
 				c.logPacket("S2C", "GS:ItemList", data)
 				newItems := l2net.ExtractEquippableItems(data)
 				if len(newItems) > 0 {

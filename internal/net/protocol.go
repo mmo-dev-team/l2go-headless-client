@@ -58,6 +58,9 @@ const (
 	OpGSRequestActionUse     = 0x56
 	OpGSValidatePosition     = 0x59
 	OpGSNpcInfo              = 0x0c
+	OpGSTeleportToLocation   = 0x22
+	OpGSAppearing            = 0x3a
+	OpGSDie                  = 0x00
 )
 
 // RSA block layout constants
@@ -189,15 +192,15 @@ func DecodeLoginOk(data []byte) (*LoginOk, error) {
 
 // GameServer contains information about an available game world.
 type GameServer struct {
-	ID             uint8
-	IP             [4]byte
+	Type           uint32
 	Port           uint16
-	AgeLimit       uint8
-	PK             bool
 	CurrentPlayers uint16
 	MaxPlayers     uint16
+	IP             [4]byte
+	ID             uint8
+	AgeLimit       uint8
+	PVP            bool
 	Online         bool
-	Type           uint32
 	Brackets       bool
 }
 
@@ -227,7 +230,7 @@ func DecodeServerList(data []byte) (*ServerListPacket, error) {
 		copy(s.IP[:], data[offset+1:offset+5])
 		s.Port = uint16(binary.LittleEndian.Uint32(data[offset+5 : offset+9]))
 		s.AgeLimit = data[offset+9]
-		s.PK = data[offset+10] == 0x01
+		s.PVP = data[offset+10] == 0x01
 		s.CurrentPlayers = binary.LittleEndian.Uint16(data[offset+11 : offset+13])
 		s.MaxPlayers = binary.LittleEndian.Uint16(data[offset+13 : offset+15])
 		s.Online = data[offset+15] == 0x01
@@ -693,4 +696,11 @@ func ExtractEquippableItems(data []byte) []uint32 {
 	}
 
 	return items
+}
+
+// EncodeGSAppearingTo writes opcode only.
+// The bot sends this after a teleport so the server clears IsTeleporting.
+func EncodeGSAppearingTo(data []byte) int {
+	data[0] = OpGSAppearing
+	return 1
 }
