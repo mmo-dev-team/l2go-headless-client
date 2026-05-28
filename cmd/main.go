@@ -37,6 +37,7 @@ func main() {
 	ramp := flag.Duration("ramp", 0, "Spread bot logins evenly across this window (e.g. 30s) instead of all at once; avoids a thundering-herd connection burst")
 	detailed := flag.Bool("detail", false, "Enable descriptive packet logging")
 	stationary := flag.Bool("stationary", false, "Enable keep bots in place and fighting")
+	scenario := flag.String("scenario", "", "Run a functional test scenario (e.g. A) instead of the load loop; with -thread N each client takes a different base class")
 
 	flag.Parse()
 
@@ -186,6 +187,17 @@ func main() {
 
 				if err = c.ConnectToGameServer(s.IP, s.Port); err != nil {
 					log.LogErr(currentAccount, "Connection to Game Server failed", err)
+					return
+				}
+
+				// Functional scenario mode: drive the lobby/world explicitly and assert, instead of the load loop.
+				if *scenario != "" {
+					class := client.StarterClasses[id%len(client.StarterClasses)]
+					if sErr := c.RunScenario(*scenario, class); sErr != nil {
+						log.LogErr(currentAccount, "SCENARIO FAILED", sErr)
+					} else {
+						log.Log(currentAccount, "SCENARIO PASS")
+					}
 					return
 				}
 

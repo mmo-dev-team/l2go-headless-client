@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,7 +67,11 @@ type Client struct {
 	y             int32
 	z             int32
 	pendingAppear atomic.Bool
+	converged     atomic.Bool
 	dead          atomic.Bool
+	mp            atomic.Int32
+	maxMp         atomic.Int32
+	skillReady    sync.Map
 	gsCrypt       crypto.GameCrypt
 }
 
@@ -324,13 +329,37 @@ func (c *Client) ConnectToGameServer(ip [4]byte, port uint16) error {
 	c.gsReader = l2net.NewReader(conn)
 	c.gsWriter = l2net.NewWriter(conn)
 	c.State = StateGSConnected
+
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
 	return nil
 }
 
-// AuthGameServer performs the full authentication handshake with the Game Server.
-func (c *Client) AuthGameServer() error {
+// sendGS encrypts the first n bytes of payload (prepared via gsWriter.Prepare) and
+// writes the packet to the Game Server.
+func (c *Client) sendGS(payload []byte, n int) error {
+	c.gsCrypt.Encrypt(payload[:n])
+	return c.gsWriter.Send(n)
+}
+
+// recvGS reads and decrypts the next Game Server packet.
+func (c *Client) recvGS() ([]byte, error) {
+	data, err := c.gsReader.Read()
+	if err != nil {
+		return nil, err
+	}
+	c.gsCrypt.Decrypt(data)
+	return data, nil
+}
+
+// HandshakeToLobby performs the GS handshake and returns the decoded character-selection info,
+// leaving the client at the lobby — WITHOUT auto-creating, selecting, or entering the world.
+// Used by the functional scenarios that drive create/select/delete/restore explicitly.
+func (c *Client) HandshakeToLobby() (*l2net.CharSelectionInfo, error) {
 	if c.State != StateGSConnected {
-		return errors.New("must be connected to GS")
+		return nil, errors.New("must be connected to GS")
 	}
 
 	// Step 1: Protocol Version (plaintext)
@@ -339,62 +368,61 @@ func (c *Client) AuthGameServer() error {
 	l2net.EncodeProtocolVersionTo(gsProtocolVersion, payload)
 	c.logPacket("C2S", "GS:ProtocolVersion", payload)
 	if err := c.gsWriter.Send(5); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Step 2: Key Exchange (plaintext)
 	data, err := c.gsReader.Read()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c.logPacket("S2C", "GS:KeyPacket", data)
-
 	key, err := l2net.DecodeGSKeyPacket(data)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	c.gsCrypt.Init(key)
 	c.State = StateGSHandshake
 
-	// Step 3: Game Auth Login (encrypted via Rolling XOR)
+	// Step 3: Game Auth Login
 	size := 1 + len(c.account)*2 + 2 + 16
 	payload = c.gsWriter.Prepare(size)
 	actualSize := l2net.EncodeAuthLoginTo(c.account, c.playKey1, c.playKey2, c.loginKey1, c.loginKey2, payload)
 	c.logPacket("C2S", "GS:AuthLogin", payload[:actualSize])
-
-	c.gsCrypt.Encrypt(payload[:actualSize])
-	if err = c.gsWriter.Send(actualSize); err != nil {
-		return err
+	if err = c.sendGS(payload, actualSize); err != nil {
+		return nil, err
 	}
 
-	// Step 4: Login Result (encrypted)
-	data, err = c.gsReader.Read()
-	if err != nil {
-		return err
+	// Step 4: Login Result
+	if data, err = c.recvGS(); err != nil {
+		return nil, err
 	}
-	c.gsCrypt.Decrypt(data)
 	c.logPacket("S2C", "GS:LoginResult", data)
 	if data[0] != l2net.OpGSLoginResult {
-		return errors.New("unexpected login result opcode")
+		return nil, errors.New("unexpected login result opcode 0x" +
+			strconv.FormatInt(int64(data[0]), 16) + " (len " + strconv.Itoa(len(data)) + ")")
 	}
 
-	// Step 5: Character Selection Info (encrypted)
-	data, err = c.gsReader.Read()
-	if err != nil {
-		return err
+	// Step 5: Character Selection Info
+	if data, err = c.recvGS(); err != nil {
+		return nil, err
 	}
-	c.gsCrypt.Decrypt(data)
 	c.logPacket("S2C", "GS:CharSelectionInfo", data)
-
 	if data[0] != l2net.OpGSCharSelectionInfo {
-		return errors.New("failed to enter lobby")
+		return nil, errors.New("failed to enter lobby: got opcode 0x" +
+			strconv.FormatInt(int64(data[0]), 16))
 	}
+	return l2net.DecodeCharSelectionInfo(data)
+}
 
-	charInfo, err := l2net.DecodeCharSelectionInfo(data)
+// AuthGameServer performs the full handshake then enters the world with a character
+// at slot 0 (auto-creating one if the account has none). This is the load-test path.
+func (c *Client) AuthGameServer() error {
+	charInfo, err := c.HandshakeToLobby()
 	if err != nil {
 		return err
 	}
+	var data, payload []byte
 
 	if charInfo.CharacterCount == 0 {
 		c.log.Log(c.account, "No characters found, creating a new one...")
@@ -572,11 +600,11 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 			// Randomly choose action: 0 = Move, 1 = Social Action, 2 = Use Item, 3 = Attack, 4 = Chat Spam
 			actionChoice := rng.Intn(5)
 
-			if stationary {
-				// Combat/siege test mode: never move (bots stay clustered and
-				// fight). Convert a move roll into an attack so cross-team enemies
-				// stay in range — without this, roaming disperses bots out of
-				// attack range and combat rarely resolves.
+			// Phase-aware: roam during the PvE phase (find village gremlins), but once
+			// the convergence hook has teleported us into the PvP cluster, hold position
+			// and fight — roaming would disperse the 1k-bot brawl out of attack range.
+			effStationary := stationary || c.converged.Load()
+			if effStationary {
 				if actionChoice == 0 {
 					actionChoice = 3
 				}
@@ -683,9 +711,9 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 							return
 						}
 
-						// Class-specific offense on the current target.
-						if c.classId == 10 {
-							// Human Mystic: Wind Strike (Skill 1177)
+						// Class-specific offense. A mystic casts Wind Strike only when it
+						// has the mana AND the skill is off cooldown.
+						if c.classId == 10 && c.canCast(1177) {
 							payload = c.gsWriter.Prepare(15)
 							size = l2net.EncodeGSRequestMagicSkillUseTo(1177, false, false, payload)
 							c.logPacket("C2S", "GS:MagicSkillUse", payload[:size])
@@ -718,6 +746,16 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 						}
 					}
 					c.log.Log(c.account, "Cycled "+strconv.Itoa(switches)+" targets")
+
+					// Sweep loot dropped by the mobs we just fought.
+					// Action 5 = AutoPickup the nearest ground item.
+					payload := c.gsWriter.Prepare(15)
+					size := l2net.EncodeGSRequestActionUseTo(5, false, false, payload)
+					c.logPacket("C2S", "GS:AutoPickup", payload[:size])
+					c.gsCrypt.Encrypt(payload[:size])
+					if err := c.gsWriter.Send(size); err != nil {
+						return
+					}
 				}
 			} else if actionChoice == 4 {
 				// Chat Spam
@@ -765,12 +803,21 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 				}
 				c.logPacket("S2C", "GS:TeleportToLocation", data)
 				c.pendingAppear.Store(true)
+				c.converged.Store(true) // convergence teleport → stop roaming, hold for PvP
 			} else if data[0] == l2net.OpGSDie {
 				if len(data) >= 5 && binary.LittleEndian.Uint32(data[1:5]) == c.objectId {
 					c.dead.Store(true)
 					c.log.Log(c.account, "DIED — cannot act, only chat")
 				}
 				c.logPacket("S2C", "GS:Die", data)
+				// Track our own MP so the bot only casts when it has mana.
+			} else if data[0] == l2net.OpGSStatusUpdate {
+				if mp, maxMp, ok := l2net.ParseSelfMp(data, c.objectId); ok {
+					c.mp.Store(mp)
+					if maxMp > 0 {
+						c.maxMp.Store(maxMp)
+					}
+				}
 				// Intercept ItemList to find equippable items
 			} else if data[0] == l2net.OpGSItemList {
 				c.logPacket("S2C", "GS:ItemList", data)
@@ -807,6 +854,11 @@ func (c *Client) RunGameLoop(ctx context.Context, stationary bool) {
 				if data[0] == l2net.OpGSAttack {
 					c.logPacket("S2C", "GS:Attack", data)
 				} else {
+					// Our own cast confirmed — record the skill's reuse so the bot
+					// won't recast it until the cooldown elapses.
+					if skillId, reuseMs, ok := l2net.ParseOwnSkillReuse(data, c.objectId); ok && reuseMs > 0 {
+						c.skillReady.Store(skillId, time.Now().Add(time.Duration(reuseMs)*time.Millisecond).UnixNano())
+					}
 					c.logPacket("S2C", "GS:MagicSkillUse", data)
 				}
 			} else {
@@ -833,6 +885,22 @@ func (c *Client) Logout() {
 	_ = c.gsWriter.Send(1)
 	// Give the server a small moment to process before the TCP connection is closed
 	time.Sleep(500 * time.Millisecond)
+}
+
+// skillMpCost is a conservative MP gate for starter skills.
+const skillMpCost = 15
+
+// canCast reports whether the bot may cast skillId now: it has the mana and the skill is off cooldown.
+func (c *Client) canCast(skillId uint32) bool {
+	if c.mp.Load() < skillMpCost {
+		return false
+	}
+	if v, ok := c.skillReady.Load(skillId); ok {
+		if time.Now().UnixNano() < v.(int64) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) logPacket(dir, name string, data []byte) {
