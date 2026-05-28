@@ -8,56 +8,74 @@ package logger
 import (
 	"bufio"
 	"os"
-	"sync"
 	"time"
 )
 
-// Logger is a high-performance, concurrent-safe logger that avoids heap allocations.
-type Logger struct {
-	out      *bufio.Writer
-	mu       sync.Mutex
-	detailed bool
-	scratch  [128]byte // Pre-allocated buffer for formatting
+type entryKind uint8
+
+const (
+	kindLog entryKind = iota
+	kindErr
+	kindPacket
+	kindRaw
+	kindFlush
+)
+
+type logEntry struct {
+	t       time.Time
+	account string
+	msg     string
+	dir     string
+	name    string
+	raw     []byte
+	done    chan struct{}
+	err     error
+	kind    entryKind
 }
 
-// NewLogger creates a new high-performance logger instance.
+// Logger is a high-performance, concurrent-safe logger backed by a channel.
+// All callers are non-blocking; a single drain goroutine owns the output buffer.
+type Logger struct {
+	ch       chan logEntry
+	detailed bool
+}
+
+// NewLogger creates a new logger instance. Call Flush() before process exit to drain the buffer.
 func NewLogger(detailed bool) *Logger {
-	return &Logger{
-		out:      bufio.NewWriterSize(os.Stdout, 65536),
+	l := &Logger{
+		ch:       make(chan logEntry, 4096),
 		detailed: detailed,
 	}
+	go l.drain()
+	return l
 }
 
 // Write writes a raw byte slice to the output.
 func (l *Logger) Write(data []byte) {
-	l.mu.Lock()
-	l.out.Write(data)
-	l.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	l.ch <- logEntry{kind: kindRaw, raw: cp}
 }
 
 // Log writes a standard info message to the output.
 func (l *Logger) Log(account, msg string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.writeHeader(account)
-	l.out.WriteString(msg)
-	l.out.WriteByte('\n')
-	l.out.Flush()
+	l.ch <- logEntry{
+		kind:    kindLog,
+		t:       time.Now(),
+		account: account,
+		msg:     msg,
+	}
 }
 
 // LogErr writes an error message to the output.
 func (l *Logger) LogErr(account, msg string, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.writeHeader(account)
-	l.out.WriteString("ERROR: ")
-	l.out.WriteString(msg)
-	if err != nil {
-		l.out.WriteString(": ")
-		l.out.WriteString(err.Error())
+	l.ch <- logEntry{
+		kind:    kindErr,
+		t:       time.Now(),
+		account: account,
+		msg:     msg,
+		err:     err,
 	}
-	l.out.WriteByte('\n')
-	l.out.Flush()
 }
 
 // LogPacket implements the client.Logger interface for descriptive protocol tracing.
@@ -65,33 +83,63 @@ func (l *Logger) LogPacket(account, dir, name string, _ []byte) {
 	if !l.detailed {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.writeHeader(account)
-	l.out.WriteString(dir)
-	l.out.WriteString(": ")
-	l.out.WriteString(name)
-	l.out.WriteByte('\n')
-	l.out.Flush()
-}
-
-// writeHeader writes the timestamp and account context to the buffer.
-func (l *Logger) writeHeader(account string) {
-	l.out.WriteByte('[')
-	now := time.Now()
-	res := now.AppendFormat(l.scratch[:0], "15:04:05")
-	l.out.Write(res)
-	l.out.WriteString("] ")
-	if account != "" {
-		l.out.WriteByte('(')
-		l.out.WriteString(account)
-		l.out.WriteString(") ")
+	l.ch <- logEntry{
+		kind:    kindPacket,
+		t:       time.Now(),
+		account: account,
+		dir:     dir,
+		name:    name,
 	}
 }
 
-// Flush ensures all buffered data is written to the underlying stream.
+// Flush blocks until all pending log entries are written and the buffer is flushed.
 func (l *Logger) Flush() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.out.Flush()
+	done := make(chan struct{})
+	l.ch <- logEntry{kind: kindFlush, done: done}
+	<-done
+}
+
+func (l *Logger) drain() {
+	out := bufio.NewWriterSize(os.Stdout, 65536)
+	var scratch [128]byte
+	for e := range l.ch {
+		switch e.kind {
+		case kindFlush:
+			out.Flush()
+			close(e.done)
+		case kindRaw:
+			out.Write(e.raw)
+		default:
+			writeEntry(out, scratch[:], e)
+		}
+	}
+}
+
+func writeEntry(out *bufio.Writer, scratch []byte, e logEntry) {
+	out.WriteByte('[')
+	out.Write(e.t.AppendFormat(scratch[:0], "15:04:05"))
+	out.WriteString("] ")
+	if e.account != "" {
+		out.WriteByte('(')
+		out.WriteString(e.account)
+		out.WriteString(") ")
+	}
+	switch e.kind {
+	case kindLog:
+		out.WriteString(e.msg)
+		out.WriteByte('\n')
+	case kindErr:
+		out.WriteString("ERROR: ")
+		out.WriteString(e.msg)
+		if e.err != nil {
+			out.WriteString(": ")
+			out.WriteString(e.err.Error())
+		}
+		out.WriteByte('\n')
+	case kindPacket:
+		out.WriteString(e.dir)
+		out.WriteString(": ")
+		out.WriteString(e.name)
+		out.WriteByte('\n')
+	}
 }
