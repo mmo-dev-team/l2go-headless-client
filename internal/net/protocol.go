@@ -37,7 +37,10 @@ const (
 	OpGSCharSelectionInfo    = 0x09
 	OpGSLoginResult          = 0x0a
 	OpGSCharSelected         = 0x0b
+	OpGSStatusUpdate         = 0x18
 	OpGSCharacterCreate      = 0x0c
+	OpGSCharacterDelete      = 0x0d
+	OpGSCharacterRestore     = 0x7b
 	OpGSProtocolVersion      = 0x0e
 	OpGSMoveToLocation       = 0x0f
 	OpGSCharCreateSuccess    = 0x0f
@@ -321,12 +324,24 @@ func DecodeGSKeyPacket(data []byte) ([]byte, error) {
 	return key, nil
 }
 
+// LobbyChar is one character entry decoded from the selection-info packet.
+type LobbyChar struct {
+	Name        string
+	X, Y, Z     int32
+	Level       int32
+	ClassID     uint32
+	DeleteTimer int32      // seconds until purge; >0 means pending deletion
+	Paperdoll   [33]uint32 // equipped item id per paperdoll slot
+}
+
 // CharSelectionInfo contains the number of characters available.
 type CharSelectionInfo struct {
 	CharacterCount uint32
+	Characters     []LobbyChar
 }
 
-// DecodeCharSelectionInfo parses the character selection info packet.
+// DecodeCharSelectionInfo parses the character-selection packet.
+// Used by the functional scenarios to assert characters are dressed and spawned in the right town.
 func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 	if len(data) < 5 {
 		return nil, errors.New("packet too short for CharSelectionInfo")
@@ -334,9 +349,98 @@ func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 	if data[0] != OpGSCharSelectionInfo {
 		return nil, errors.New("invalid opcode for CharSelectionInfo")
 	}
-	return &CharSelectionInfo{
-		CharacterCount: binary.LittleEndian.Uint32(data[1:5]),
-	}, nil
+
+	count := binary.LittleEndian.Uint32(data[1:5])
+	info := &CharSelectionInfo{CharacterCount: count}
+
+	pos := 18
+
+	u32 := func() (uint32, bool) {
+		if pos+4 > len(data) {
+			return 0, false
+		}
+		v := binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
+		return v, true
+	}
+	skip := func(n int) bool { pos += n; return pos <= len(data) }
+	readStr := func() (string, bool) {
+		start := pos
+		for pos+1 < len(data) {
+			if data[pos] == 0 && data[pos+1] == 0 {
+				b := data[start:pos]
+				pos += 2
+				out := make([]byte, 0, len(b)/2)
+				for i := 0; i+1 < len(b); i += 2 {
+					out = append(out, b[i])
+				}
+				return string(out), true
+			}
+			pos += 2
+		}
+		return "", false
+	}
+
+	for i := uint32(0); i < count; i++ {
+		var ch LobbyChar
+		var ok bool
+		if ch.Name, ok = readStr(); !ok {
+			return nil, errors.New("truncated: name")
+		}
+		if _, ok = u32(); !ok {
+			return nil, errors.New("truncated: id")
+		}
+		if _, ok = readStr(); !ok {
+			return nil, errors.New("truncated: account")
+		}
+		skip(28)
+		if x, k := u32(); k {
+			ch.X = int32(x)
+		}
+		if y, k := u32(); k {
+			ch.Y = int32(y)
+		}
+		if z, k := u32(); k {
+			ch.Z = int32(z)
+		}
+		skip(40)
+		if lvl, k := u32(); k {
+			ch.Level = int32(lvl)
+		}
+		skip(25)
+		for s := 0; s < 33; s++ {
+			if v, k := u32(); k {
+				ch.Paperdoll[s] = v
+			}
+		}
+		skip(94)
+		if dt, k := u32(); k {
+			ch.DeleteTimer = int32(dt)
+		}
+		if cid, k := u32(); k {
+			ch.ClassID = cid
+		}
+		skip(68)
+		if pos > len(data) {
+			return nil, errors.New("truncated character entry")
+		}
+		info.Characters = append(info.Characters, ch)
+	}
+	return info, nil
+}
+
+// EncodeGSCharacterDeleteTo writes a character-delete request (slot) into the buffer.
+func EncodeGSCharacterDeleteTo(charSlot int32, data []byte) int {
+	data[0] = OpGSCharacterDelete
+	binary.LittleEndian.PutUint32(data[1:], uint32(charSlot))
+	return 5
+}
+
+// EncodeGSCharacterRestoreTo writes a character-restore request (slot) into the buffer.
+func EncodeGSCharacterRestoreTo(charSlot int32, data []byte) int {
+	data[0] = OpGSCharacterRestore
+	binary.LittleEndian.PutUint32(data[1:], uint32(charSlot))
+	return 5
 }
 
 // EncodeGSCharacterCreateTo writes a Game Server character create request into the provided buffer.
@@ -698,8 +802,46 @@ func ExtractEquippableItems(data []byte) []uint32 {
 	return items
 }
 
+// ParseSelfMp extracts (mp, maxMp) from a StatusUpdate packet.
+func ParseSelfMp(data []byte, selfObjId uint32) (mp, maxMp int32, ok bool) {
+	if len(data) < 11 || data[0] != OpGSStatusUpdate {
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint32(data[1:5]) != selfObjId {
+		return 0, 0, false
+	}
+	count := int(data[10])
+	pos := 11
+	for i := 0; i < count; i++ {
+		if pos+5 > len(data) {
+			break
+		}
+		val := int32(binary.LittleEndian.Uint32(data[pos+1 : pos+5]))
+		switch data[pos] {
+		case 0x0B:
+			mp, ok = val, true
+		case 0x0C:
+			maxMp = val
+		}
+		pos += 5
+	}
+	return mp, maxMp, ok
+}
+
+// ParseOwnSkillReuse extracts (skillId, reuseMs) from a MagicSkillUse packet.
+func ParseOwnSkillReuse(data []byte, selfObjId uint32) (skillId uint32, reuseMs int32, ok bool) {
+	if len(data) < 33 || data[0] != OpGSMagicSkillUse {
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint32(data[5:9]) != selfObjId {
+		return 0, 0, false
+	}
+	skillId = binary.LittleEndian.Uint32(data[13:17])
+	reuseMs = int32(binary.LittleEndian.Uint32(data[29:33]))
+	return skillId, reuseMs, true
+}
+
 // EncodeGSAppearingTo writes opcode only.
-// The bot sends this after a teleport so the server clears IsTeleporting.
 func EncodeGSAppearingTo(data []byte) int {
 	data[0] = OpGSAppearing
 	return 1
