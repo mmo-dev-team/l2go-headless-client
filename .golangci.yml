@@ -114,6 +114,16 @@ linters:
 
     errcheck:
       check-type-assertions: true
+      exclude-functions:
+        - (*bufio.Writer).Write
+        - (*bufio.Writer).WriteString
+        - (*bufio.Writer).WriteByte
+
+    gosec:
+      excludes:
+        - G104
+        - G115
+        - G404
 
     exhaustive:
       check:

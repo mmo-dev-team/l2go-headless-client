@@ -23,7 +23,28 @@ import (
 	"github.com/mmo-dev-team/l2go-headless-client/internal/logger"
 )
 
+type creds struct {
+	user string
+	pass string
+}
+
+type botConfig struct {
+	log        *logger.Logger
+	addr       string
+	scenario   string
+	creds      []creds
+	staticKey  []byte
+	ramp       time.Duration
+	serverIdx  int
+	count      int
+	stationary bool
+}
+
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	// Connection Flags
 	ipFlag := flag.String("ip", "", "Login server IP address")
 	portFlag := flag.Int("port", 2106, "Login server port number")
@@ -46,46 +67,18 @@ func main() {
 	defer log.Flush()
 
 	stdin := bufio.NewReader(os.Stdin)
-
-	var addr string
-	// Interactive logic for server address if not provided via flags.
-	if *ipFlag != "" {
-		addr = strings.TrimSpace(*ipFlag) + ":" + strconv.Itoa(*portFlag)
-	} else {
-		os.Stdout.WriteString("Enter Server Address (localhost:2106): ")
-		line, _ := stdin.ReadString('\n')
-		addr = strings.TrimSpace(line)
-		if addr == "" {
-			addr = "localhost:2106"
-		}
-	}
-
-	accountBase := *userFlag
-	passwordBase := *passFlag
-
-	// Prompt for credentials if not in bulk test mode.
-	if *threads <= 1 {
-		if accountBase == "" {
-			os.Stdout.WriteString("Enter Login: ")
-			line, _ := stdin.ReadString('\n')
-			accountBase = strings.TrimSpace(line)
-		}
-		if passwordBase == "" {
-			os.Stdout.WriteString("Enter Password: ")
-			line, _ := stdin.ReadString('\n')
-			passwordBase = strings.TrimSpace(line)
-		}
-	}
+	addr := resolveAddr(stdin, *ipFlag, *portFlag)
+	accountBase, passwordBase := promptCredentials(stdin, *threads, *userFlag, *passFlag)
 
 	if accountBase == "" || passwordBase == "" {
 		log.Log("", "ERROR: Login and Password are required")
-		os.Exit(1)
+		return 1
 	}
 
 	staticKey, err := hex.DecodeString(*bfKeyHex)
 	if err != nil {
 		log.Log("", "ERROR: Invalid Blowfish key")
-		os.Exit(1)
+		return 1
 	}
 
 	// Create context to handle graceful shutdown
@@ -100,120 +93,176 @@ func main() {
 		cancel()
 	}()
 
-	var wg sync.WaitGroup
 	count := *threads
-
 	log.Log("", "Starting "+strconv.Itoa(count)+" concurrent clients...")
 
-	// Pre-allocate account and password strings to reach Zero-Alloc in hot loops.
-	type creds struct {
-		user string
-		pass string
+	runFleet(ctx, &botConfig{
+		creds:      buildCreds(accountBase, passwordBase, count),
+		staticKey:  staticKey,
+		addr:       addr,
+		scenario:   *scenario,
+		log:        log,
+		ramp:       *ramp,
+		serverIdx:  *serverIdx,
+		count:      count,
+		stationary: *stationary,
+	})
+
+	log.Log("", "Stress test completed. All clients finished.")
+	return 0
+}
+
+// resolveAddr returns the server address from the flag, or prompts for it interactively.
+func resolveAddr(stdin *bufio.Reader, ipFlag string, portFlag int) string {
+	if ipFlag != "" {
+		return strings.TrimSpace(ipFlag) + ":" + strconv.Itoa(portFlag)
 	}
-	allCreds := make([]creds, count)
-	for i := 0; i < count; i++ {
+	os.Stdout.WriteString("Enter Server Address (localhost:2106): ")
+	line, _ := stdin.ReadString('\n')
+	addr := strings.TrimSpace(line)
+	if addr == "" {
+		return "localhost:2106"
+	}
+	return addr
+}
+
+// promptCredentials returns the account/password bases, prompting interactively only in
+// single-client mode when they were not supplied via flags.
+func promptCredentials(stdin *bufio.Reader, threads int, userFlag, passFlag string) (string, string) {
+	account, password := userFlag, passFlag
+	if threads > 1 {
+		return account, password
+	}
+	if account == "" {
+		os.Stdout.WriteString("Enter Login: ")
+		line, _ := stdin.ReadString('\n')
+		account = strings.TrimSpace(line)
+	}
+	if password == "" {
+		os.Stdout.WriteString("Enter Password: ")
+		line, _ := stdin.ReadString('\n')
+		password = strings.TrimSpace(line)
+	}
+	return account, password
+}
+
+// buildCreds pre-allocates per-client account/password strings to keep the hot loops zero-alloc.
+func buildCreds(accountBase, passwordBase string, count int) []creds {
+	all := make([]creds, count)
+	for i := range count {
 		if count > 1 {
 			suffix := strconv.Itoa(i)
-			allCreds[i] = creds{
-				user: accountBase + suffix,
-				pass: passwordBase + suffix,
-			}
+			all[i] = creds{user: accountBase + suffix, pass: passwordBase + suffix}
 		} else {
-			allCreds[i] = creds{user: accountBase, pass: passwordBase}
+			all[i] = creds{user: accountBase, pass: passwordBase}
 		}
 	}
+	return all
+}
 
-	for i := 0; i < count; i++ {
+// runFleet spawns one goroutine per simulated client and waits for them all to finish.
+func runFleet(ctx context.Context, cfg *botConfig) {
+	var wg sync.WaitGroup
+	for i := range cfg.count {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-
-			if *ramp > 0 && count > 1 {
-				slot := time.Duration(int64(*ramp) / int64(count))
-				delay := time.Duration(id) * slot
-				if slot > 0 {
-					delay += time.Duration(rand.Int64N(int64(slot)))
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(delay):
-				}
-			}
-
-			currentAccount := allCreds[id].user
-			c := client.NewClient(addr, currentAccount, allCreds[id].pass, staticKey, log)
-			defer c.Close()
-
-			// Execute the full authentication pipeline.
-			if err = c.Connect(); err != nil {
-				log.LogErr(currentAccount, "Connection to Login Server failed", err)
-				return
-			}
-
-			if err = c.HandleInit(); err != nil {
-				log.LogErr(currentAccount, "Login Server handshake failed", err)
-				return
-			}
-
-			if err = c.SendAuthGG(); err != nil {
-				log.LogErr(currentAccount, "GameGuard verification failed", err)
-				return
-			}
-
-			if err = c.Login(); err != nil {
-				log.Log(currentAccount, "LOGIN FAILED: "+err.Error())
-				return
-			}
-			log.Log(currentAccount, "Login successful")
-
-			if err = c.FetchServerList(); err != nil {
-				log.LogErr(currentAccount, "Failed to retrieve server list", err)
-				return
-			}
-
-			serverCount := len(c.Servers)
-			if serverCount > 0 {
-				targetIdx := *serverIdx - 1
-				if targetIdx < 0 || targetIdx >= serverCount {
-					targetIdx = 0
-				}
-				s := c.Servers[targetIdx]
-
-				if err = c.SelectServer(s.ID); err != nil {
-					log.LogErr(currentAccount, "Server selection failed", err)
-					return
-				}
-
-				if err = c.ConnectToGameServer(s.IP, s.Port); err != nil {
-					log.LogErr(currentAccount, "Connection to Game Server failed", err)
-					return
-				}
-
-				// Functional scenario mode: drive the lobby/world explicitly and assert, instead of the load loop.
-				if *scenario != "" {
-					class := client.StarterClasses[id%len(client.StarterClasses)]
-					if sErr := c.RunScenario(*scenario, class); sErr != nil {
-						log.LogErr(currentAccount, "SCENARIO FAILED", sErr)
-					} else {
-						log.Log(currentAccount, "SCENARIO PASS")
-					}
-					return
-				}
-
-				if err = c.AuthGameServer(); err != nil {
-					log.LogErr(currentAccount, "Game Server authentication failed", err)
-					return
-				}
-
-				log.Log(currentAccount, "SUCCESS: Entered game world")
-				c.RunGameLoop(ctx, *stationary)
-			} else {
-				log.Log(currentAccount, "ERROR: No servers available in list")
-			}
+			runBot(ctx, id, cfg)
 		}(i)
 	}
-
 	wg.Wait()
-	log.Log("", "Stress test completed. All clients finished.")
+}
+
+// runBot executes the full authentication pipeline for one simulated client and then
+// either runs the requested functional scenario or the load loop.
+func runBot(ctx context.Context, id int, cfg *botConfig) {
+	log := cfg.log
+
+	if cfg.ramp > 0 && cfg.count > 1 {
+		slot := time.Duration(int64(cfg.ramp) / int64(cfg.count))
+		delay := time.Duration(id) * slot
+		if slot > 0 {
+			delay += time.Duration(rand.Int64N(int64(slot)))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+
+	account := cfg.creds[id].user
+	c := client.NewClient(cfg.addr, account, cfg.creds[id].pass, cfg.staticKey, log)
+	defer c.Close()
+
+	if !loginPipeline(c, account, log) {
+		return
+	}
+
+	if len(c.Servers) == 0 {
+		log.Log(account, "ERROR: No servers available in list")
+		return
+	}
+
+	targetIdx := cfg.serverIdx - 1
+	if targetIdx < 0 || targetIdx >= len(c.Servers) {
+		targetIdx = 0
+	}
+	s := c.Servers[targetIdx]
+
+	if err := c.SelectServer(s.ID); err != nil {
+		log.LogErr(account, "Server selection failed", err)
+		return
+	}
+	if err := c.ConnectToGameServer(s.IP, s.Port); err != nil {
+		log.LogErr(account, "Connection to Game Server failed", err)
+		return
+	}
+
+	// Functional scenario mode: drive the lobby/world explicitly and assert, instead of the load loop.
+	if cfg.scenario != "" {
+		class := client.StarterClasses[id%len(client.StarterClasses)]
+		if sErr := c.RunScenario(cfg.scenario, class); sErr != nil {
+			log.LogErr(account, "SCENARIO FAILED", sErr)
+		} else {
+			log.Log(account, "SCENARIO PASS")
+		}
+		return
+	}
+
+	if err := c.AuthGameServer(); err != nil {
+		log.LogErr(account, "Game Server authentication failed", err)
+		return
+	}
+
+	log.Log(account, "SUCCESS: Entered game world")
+	c.RunGameLoop(ctx, cfg.stationary)
+}
+
+// loginPipeline runs the Login Server handshake up to fetching the server list.
+// It returns false (after logging) on the first failure.
+func loginPipeline(c *client.Client, account string, log *logger.Logger) bool {
+	if err := c.Connect(); err != nil {
+		log.LogErr(account, "Connection to Login Server failed", err)
+		return false
+	}
+	if err := c.HandleInit(); err != nil {
+		log.LogErr(account, "Login Server handshake failed", err)
+		return false
+	}
+	if err := c.SendAuthGG(); err != nil {
+		log.LogErr(account, "GameGuard verification failed", err)
+		return false
+	}
+	if err := c.Login(); err != nil {
+		log.Log(account, "LOGIN FAILED: "+err.Error())
+		return false
+	}
+	log.Log(account, "Login successful")
+
+	if err := c.FetchServerList(); err != nil {
+		log.LogErr(account, "Failed to retrieve server list", err)
+		return false
+	}
+	return true
 }

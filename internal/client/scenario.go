@@ -56,6 +56,8 @@ func (c *Client) RunScenario(name string, class int32) (err error) {
 
 // ScenarioEnterWorld creates a character if needed, enters the world,
 // and asserts the server delivers an inventory with equippable gear.
+//
+//nolint:gocognit // post-enter packet-burst assertion loop; the case handling is clearer inline
 func (c *Client) ScenarioEnterWorld(class int32) error {
 	info, err := c.HandshakeToLobby()
 	if err != nil {
@@ -67,16 +69,20 @@ func (c *Client) ScenarioEnterWorld(class int32) error {
 		}
 	}
 
-	objId, _, x, y, z, sErr := c.selectAndEnter(0)
+	objID, _, x, y, z, sErr := c.selectAndEnter(0)
 	if sErr != nil {
 		return sErr
 	}
-	c.objectId, c.x, c.y, c.z = objId, x, y, z
+	c.objectID = objID
+	c.x.Store(x)
+	c.y.Store(y)
+	c.z.Store(z)
 
 	// Read the post-enter burst until the inventory (ItemList) arrives or time out.
-	_ = c.gsConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	_ = c.gsConn.SetReadDeadline(time.Now().Add(time.Duration(15) * time.Second))
 	defer func() { _ = c.gsConn.SetReadDeadline(time.Time{}) }()
 
+	var gear []uint32
 	gotItemList := false
 	gearCount := 0
 	for !gotItemList {
@@ -94,22 +100,23 @@ func (c *Client) ScenarioEnterWorld(class int32) error {
 			// carries the parseable item payload, so wait for it before counting gear.
 			if len(data) >= 2 && data[1] == 2 {
 				if items := l2net.ExtractEquippableItems(data); len(items) > 0 {
-					c.inventory = items
+					gear = items
+					c.setInventory(items)
 					gearCount = len(items)
 				}
 				gotItemList = true
 			}
 		case l2net.OpGSDie:
-			if len(data) >= 5 && binary.LittleEndian.Uint32(data[1:5]) == c.objectId {
+			if len(data) >= 5 && binary.LittleEndian.Uint32(data[1:5]) == c.objectID {
 				return errors.New("scenario C: character died on entering the world")
 			}
 		}
 	}
 
 	// If equippable gear was delivered, fire one equip action.
-	if len(c.inventory) > 0 {
+	if len(gear) > 0 {
 		payload := c.gsWriter.Prepare(15)
-		n := l2net.EncodeGSUseItemTo(c.inventory[0], false, payload)
+		n := l2net.EncodeGSUseItemTo(gear[0], false, payload)
 		if eErr := c.sendGS(payload, n); eErr != nil {
 			return errors.New("scenario D: equip action failed: " + eErr.Error())
 		}
@@ -223,11 +230,14 @@ func (c *Client) ScenarioCreateAndEnter(class int32) error {
 		}
 	}
 
-	objId, gotClass, x, y, z, sErr := c.selectAndEnter(0)
+	objID, gotClass, x, y, z, sErr := c.selectAndEnter(0)
 	if sErr != nil {
 		return sErr
 	}
-	c.objectId, c.classId, c.x, c.y, c.z = objId, gotClass, x, y, z
+	c.objectID, c.classID = objID, gotClass
+	c.x.Store(x)
+	c.y.Store(y)
+	c.z.Store(z)
 
 	tc, ok := townCenter[class]
 	if !ok {
@@ -273,39 +283,44 @@ func (c *Client) createNamedCharacter(name string, class int32) error {
 
 // selectAndEnter selects the character at slot and enters the world, returning the
 // spawn coordinates from CharSelected.
-func (c *Client) selectAndEnter(slot int32) (objId, class uint32, x, y, z int32, err error) {
+func (c *Client) selectAndEnter(slot int32) (uint32, uint32, int32, int32, int32, error) {
+	var (
+		objID, class uint32
+		x, y, z      int32
+		err          error
+	)
 	payload := c.gsWriter.Prepare(30)
 	n := l2net.EncodeGSCharacterSelectTo(slot, payload)
 	c.logPacket("C2S", "GS:CharacterSelect", payload[:n])
 	if err = c.sendGS(payload, n); err != nil {
-		return
+		return objID, class, x, y, z, err
 	}
 
 	for {
 		var data []byte
 		if data, err = c.recvGS(); err != nil {
-			return
+			return objID, class, x, y, z, err
 		}
 		if len(data) == 0 {
 			continue // empty keep-alive / framing packet
 		}
 		if data[0] == l2net.OpGSCharSelected {
-			objId, class, x, y, z, err = l2net.DecodeCharSelected(data)
+			objID, class, x, y, z, err = l2net.DecodeCharSelected(data)
 			break
 		}
 	}
 	if err != nil {
-		return
+		return objID, class, x, y, z, err
 	}
 
 	payload = c.gsWriter.Prepare(110)
 	n = l2net.EncodeGSEnterWorldTo(payload)
 	c.logPacket("C2S", "GS:EnterWorld", payload[:n])
 	if err = c.sendGS(payload, n); err != nil {
-		return
+		return objID, class, x, y, z, err
 	}
 	c.State = StateGSLoggedIn
-	return
+	return objID, class, x, y, z, err
 }
 
 // sanitizeName derives a valid (alphanumeric, <=16) character name from the account.

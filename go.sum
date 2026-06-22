@@ -1,2 +1,6 @@
 github.com/mmo-dev-team/l2go-auth v0.0.0-20260520081949-c89293bac6ca h1:JjoMOdZazSzespN5ARDI3ZDS82pMJaZDJXKU4ZkFPg0=
 github.com/mmo-dev-team/l2go-auth v0.0.0-20260520081949-c89293bac6ca/go.mod h1:9tHXgeqDNSM4b7OT8wKZ/RRuiMiMo19yeGmXcqaxQuA=
+github.com/mmo-dev-team/l2go-auth v0.0.0-20260527212331-6fb4efa56f2b h1:GxeQTNLLhuzkxGYZ8zjTfuAM4lC9jSlhdm+/TiNL2lQ=
+github.com/mmo-dev-team/l2go-auth v0.0.0-20260527212331-6fb4efa56f2b/go.mod h1:V/JQKTYhXUGUmqSr8GdL5Pn4jsyf3ikD1VMS57J4LoU=
+github.com/mmo-dev-team/l2go-auth v0.0.0-20260622191915-5ba6e9214e1c h1:lHL2kPCd3QR0EImSAM4aCX8OfEshxhy1tbXNjxDh+FA=
+github.com/mmo-dev-team/l2go-auth v0.0.0-20260622191915-5ba6e9214e1c/go.mod h1:V/JQKTYhXUGUmqSr8GdL5Pn4jsyf3ikD1VMS57J4LoU=

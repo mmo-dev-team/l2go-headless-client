@@ -14,8 +14,8 @@ import (
 // Crypt handles packet encryption and decryption using the Blowfish algorithm and a custom XOR-based checksum.
 // It is designed for the Lineage 2 Login Server protocol.
 type Crypt struct {
-	updatedKey bool
 	cipher     *authcrypto.BlowfishCipher
+	updatedKey bool
 }
 
 // NewCrypt creates a new Crypt instance with the given Blowfish key.
