@@ -43,16 +43,16 @@ func UnscrambleModulus(mod []byte) {
 		return
 	}
 
-	for i := 0; i < 0x40; i++ {
+	for i := range 0x40 {
 		mod[0x40+i] ^= mod[i]
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		mod[0x0d+i] ^= mod[0x34+i]
 	}
-	for i := 0; i < 0x40; i++ {
+	for i := range 0x40 {
 		mod[i] ^= mod[0x40+i]
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		mod[i], mod[0x4d+i] = mod[0x4d+i], mod[i]
 	}
 }

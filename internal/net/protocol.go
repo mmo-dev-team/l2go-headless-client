@@ -106,10 +106,10 @@ func GetLoginFailReason(data []byte) string {
 
 // InitPacket contains initial session data sent by the Login Server.
 type InitPacket struct {
-	SessionID       uint32
-	ProtocolVersion uint32
 	RSAModulus      []byte // 128 bytes
 	BlowfishKey     []byte // 16 bytes for High Five
+	SessionID       uint32
+	ProtocolVersion uint32
 }
 
 // DecodeInit parses the server's initial handshake packet.
@@ -209,8 +209,8 @@ type GameServer struct {
 
 // ServerListPacket contains the list of available game worlds.
 type ServerListPacket struct {
-	LastServerID uint8
 	Servers      []GameServer
+	LastServerID uint8
 }
 
 // DecodeServerList parses the server list sent by the Login Server.
@@ -224,7 +224,7 @@ func DecodeServerList(data []byte) (*ServerListPacket, error) {
 	servers := make([]GameServer, 0, count)
 
 	offset := 3
-	for i := 0; i < int(count); i++ {
+	for range count {
 		if len(data) < offset+H5ServerListEntrySize {
 			break
 		}
@@ -293,7 +293,7 @@ func EncodeAuthLoginTo(account string, playKey1, playKey2, loginKey1, loginKey2 
 	data[0] = OpGSAuthLogin
 	pos := 1
 	// Write account name as UTF-16LE efficiently
-	for i := 0; i < len(account); i++ {
+	for i := range len(account) {
 		data[pos] = account[i]
 		data[pos+1] = 0
 		pos += 2
@@ -336,12 +336,14 @@ type LobbyChar struct {
 
 // CharSelectionInfo contains the number of characters available.
 type CharSelectionInfo struct {
-	CharacterCount uint32
 	Characters     []LobbyChar
+	CharacterCount uint32
 }
 
 // DecodeCharSelectionInfo parses the character-selection packet.
 // Used by the functional scenarios to assert characters are dressed and spawned in the right town.
+//
+//nolint:gocognit,funlen // flat binary field-by-field decoder; sub-splitting the fixed packet layout adds no clarity
 func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 	if len(data) < 5 {
 		return nil, errors.New("packet too short for CharSelectionInfo")
@@ -363,7 +365,7 @@ func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 		pos += 4
 		return v, true
 	}
-	skip := func(n int) bool { pos += n; return pos <= len(data) }
+	skip := func(n int) { pos += n }
 	readStr := func() (string, bool) {
 		start := pos
 		for pos+1 < len(data) {
@@ -381,7 +383,7 @@ func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 		return "", false
 	}
 
-	for i := uint32(0); i < count; i++ {
+	for range count {
 		var ch LobbyChar
 		var ok bool
 		if ch.Name, ok = readStr(); !ok {
@@ -408,7 +410,7 @@ func DecodeCharSelectionInfo(data []byte) (*CharSelectionInfo, error) {
 			ch.Level = int32(lvl)
 		}
 		skip(25)
-		for s := 0; s < 33; s++ {
+		for s := range 33 {
 			if v, k := u32(); k {
 				ch.Paperdoll[s] = v
 			}
@@ -445,11 +447,20 @@ func EncodeGSCharacterRestoreTo(charSlot int32, data []byte) int {
 
 // EncodeGSCharacterCreateTo writes a Game Server character create request into the provided buffer.
 // It returns the actual number of bytes written.
-func EncodeGSCharacterCreateTo(name string, race int32, isFemale bool, classId int32, hairStyle, hairColor, face int32, data []byte) int {
+func EncodeGSCharacterCreateTo(
+	name string,
+	race int32,
+	isFemale bool,
+	classID int32,
+	hairStyle,
+	hairColor,
+	face int32,
+	data []byte,
+) int {
 	data[0] = OpGSCharacterCreate
 	pos := 1
 
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		data[pos] = name[i]
 		data[pos+1] = 0
 		pos += 2
@@ -466,10 +477,10 @@ func EncodeGSCharacterCreateTo(name string, race int32, isFemale bool, classId i
 		binary.LittleEndian.PutUint32(data[pos:], 0)
 	}
 	pos += 4
-	binary.LittleEndian.PutUint32(data[pos:], uint32(classId))
+	binary.LittleEndian.PutUint32(data[pos:], uint32(classID))
 	pos += 4
 
-	for i := 0; i < 6; i++ {
+	for range 6 {
 		binary.LittleEndian.PutUint32(data[pos:], 40)
 		pos += 4
 	}
@@ -505,11 +516,16 @@ func EncodeGSCharacterSelectTo(charSlot int32, data []byte) int {
 	return pos
 }
 
-// DecodeCharSelected parses the CharSelected packet to extract initial coordinates, objectId, and classId.
-func DecodeCharSelected(data []byte) (objId, classId uint32, x, y, z int32, err error) {
+// DecodeCharSelected parses the CharSelected packet to extract initial coordinates, objectID, and classID.
+func DecodeCharSelected(data []byte) (uint32, uint32, int32, int32, int32, error) {
 	if len(data) < 1 {
 		return 0, 0, 0, 0, 0, errors.New("packet too short")
 	}
+	var (
+		objID, classID uint32
+		x, y, z        int32
+		err            error
+	)
 	pos := 1
 
 	// Helper to skip a UTF-16LE string
@@ -529,7 +545,7 @@ func DecodeCharSelected(data []byte) (objId, classId uint32, x, y, z int32, err 
 	if pos+4 > len(data) {
 		return 0, 0, 0, 0, 0, errors.New("packet too short")
 	}
-	objId = binary.LittleEndian.Uint32(data[pos:])
+	objID = binary.LittleEndian.Uint32(data[pos:])
 	pos += 4 // ObjectId
 
 	if err = skipString(); err != nil { // Title
@@ -544,7 +560,7 @@ func DecodeCharSelected(data []byte) (objId, classId uint32, x, y, z int32, err 
 	pos += 4 // ??
 	pos += 4 // Sex
 	pos += 4 // Race
-	classId = binary.LittleEndian.Uint32(data[pos:])
+	classID = binary.LittleEndian.Uint32(data[pos:])
 	pos += 4 // ClassId
 	pos += 4 // Active
 
@@ -554,7 +570,7 @@ func DecodeCharSelected(data []byte) (objId, classId uint32, x, y, z int32, err 
 	pos += 4
 	z = int32(binary.LittleEndian.Uint32(data[pos:]))
 
-	return objId, classId, x, y, z, nil
+	return objID, classID, x, y, z, nil
 }
 
 // EncodeGSMoveToLocationTo writes a Game Server MoveToLocation request into the provided buffer.
@@ -600,11 +616,11 @@ func EncodeGSValidatePositionTo(x, y, z, heading int32, data []byte) int {
 }
 
 // EncodeGSRequestActionUseTo writes a Game Server RequestActionUse request into the provided buffer.
-func EncodeGSRequestActionUseTo(actionId int32, ctrlPressed, shiftPressed bool, data []byte) int {
+func EncodeGSRequestActionUseTo(actionID int32, ctrlPressed, shiftPressed bool, data []byte) int {
 	data[0] = OpGSRequestActionUse
 	pos := 1
 
-	binary.LittleEndian.PutUint32(data[pos:], uint32(actionId))
+	binary.LittleEndian.PutUint32(data[pos:], uint32(actionID))
 	pos += 4
 
 	if ctrlPressed {
@@ -619,17 +635,17 @@ func EncodeGSRequestActionUseTo(actionId int32, ctrlPressed, shiftPressed bool, 
 	} else {
 		data[pos] = 0
 	}
-	pos += 1
+	pos++
 
 	return pos
 }
 
 // EncodeGSUseItemTo writes a Game Server UseItem request into the provided buffer.
-func EncodeGSUseItemTo(objectId uint32, ctrlPressed bool, data []byte) int {
+func EncodeGSUseItemTo(objectID uint32, ctrlPressed bool, data []byte) int {
 	data[0] = OpGSUseItem
 	pos := 1
 
-	binary.LittleEndian.PutUint32(data[pos:], objectId)
+	binary.LittleEndian.PutUint32(data[pos:], objectID)
 	pos += 4
 
 	if ctrlPressed {
@@ -643,10 +659,10 @@ func EncodeGSUseItemTo(objectId uint32, ctrlPressed bool, data []byte) int {
 }
 
 // EncodeGSActionTo writes a Game Server Action request (to target/interact).
-func EncodeGSActionTo(objectId uint32, originX, originY, originZ int32, actionId byte, data []byte) int {
+func EncodeGSActionTo(objectID uint32, originX, originY, originZ int32, actionID byte, data []byte) int {
 	data[0] = OpGSAction
 	pos := 1
-	binary.LittleEndian.PutUint32(data[pos:], objectId)
+	binary.LittleEndian.PutUint32(data[pos:], objectID)
 	pos += 4
 	binary.LittleEndian.PutUint32(data[pos:], uint32(originX))
 	pos += 4
@@ -654,16 +670,16 @@ func EncodeGSActionTo(objectId uint32, originX, originY, originZ int32, actionId
 	pos += 4
 	binary.LittleEndian.PutUint32(data[pos:], uint32(originZ))
 	pos += 4
-	data[pos] = actionId
-	pos += 1
+	data[pos] = actionID
+	pos++
 	return pos
 }
 
 // EncodeGSAttackRequestTo writes a Game Server AttackRequest.
-func EncodeGSAttackRequestTo(objectId uint32, originX, originY, originZ int32, attackId byte, data []byte) int {
+func EncodeGSAttackRequestTo(objectID uint32, originX, originY, originZ int32, attackID byte, data []byte) int {
 	data[0] = OpGSAttackRequest
 	pos := 1
-	binary.LittleEndian.PutUint32(data[pos:], objectId)
+	binary.LittleEndian.PutUint32(data[pos:], objectID)
 	pos += 4
 	binary.LittleEndian.PutUint32(data[pos:], uint32(originX))
 	pos += 4
@@ -671,17 +687,17 @@ func EncodeGSAttackRequestTo(objectId uint32, originX, originY, originZ int32, a
 	pos += 4
 	binary.LittleEndian.PutUint32(data[pos:], uint32(originZ))
 	pos += 4
-	data[pos] = attackId
-	pos += 1
+	data[pos] = attackID
+	pos++
 	return pos
 }
 
 // EncodeGSRequestMagicSkillUseTo writes a Game Server RequestMagicSkillUse request into the provided buffer.
-func EncodeGSRequestMagicSkillUseTo(magicId uint32, ctrlPressed, shiftPressed bool, data []byte) int {
+func EncodeGSRequestMagicSkillUseTo(magicID uint32, ctrlPressed, shiftPressed bool, data []byte) int {
 	data[0] = OpGSRequestMagicSkillUse
 	pos := 1
 
-	binary.LittleEndian.PutUint32(data[pos:], magicId)
+	binary.LittleEndian.PutUint32(data[pos:], magicID)
 	pos += 4
 
 	if ctrlPressed {
@@ -718,7 +734,7 @@ func EncodeGSSay2To(text string, chatType int32, data []byte) int {
 	pos := 1
 
 	// Write text as UTF-16LE
-	for i := 0; i < len(text); i++ {
+	for i := range len(text) {
 		data[pos] = text[i]
 		data[pos+1] = 0
 		pos += 2
@@ -735,6 +751,8 @@ func EncodeGSSay2To(text string, chatType int32, data []byte) int {
 }
 
 // ExtractEquippableItems parses an ItemList packet and extracts ObjectIDs of equippable items.
+//
+//nolint:gocognit // variable-length item record walker driven by the item mask; inherently branchy
 func ExtractEquippableItems(data []byte) []uint32 {
 	var items []uint32
 
@@ -757,18 +775,18 @@ func ExtractEquippableItems(data []byte) []uint32 {
 		return items // Only sendType 2 contains the actual items in the payload
 	}
 
-	for i := uint32(0); i < count; i++ {
+	for range count {
 		if pos+43 > len(data) {
 			break
 		}
 
 		mask := data[pos]
-		objectId := binary.LittleEndian.Uint32(data[pos+1 : pos+5])
+		objectID := binary.LittleEndian.Uint32(data[pos+1 : pos+5])
 		type2 := data[pos+18]
 
 		// Type 2: 00-weapon, 01-shield/armor, 02-ring/earring/necklace
 		if type2 <= 2 {
-			items = append(items, objectId)
+			items = append(items, objectID)
 		}
 
 		pos += 43
@@ -803,16 +821,20 @@ func ExtractEquippableItems(data []byte) []uint32 {
 }
 
 // ParseSelfMp extracts (mp, maxMp) from a StatusUpdate packet.
-func ParseSelfMp(data []byte, selfObjId uint32) (mp, maxMp int32, ok bool) {
+func ParseSelfMp(data []byte, selfObjID uint32) (int32, int32, bool) {
 	if len(data) < 11 || data[0] != OpGSStatusUpdate {
 		return 0, 0, false
 	}
-	if binary.LittleEndian.Uint32(data[1:5]) != selfObjId {
+	if binary.LittleEndian.Uint32(data[1:5]) != selfObjID {
 		return 0, 0, false
 	}
+	var (
+		mp, maxMp int32
+		ok        bool
+	)
 	count := int(data[10])
 	pos := 11
-	for i := 0; i < count; i++ {
+	for range count {
 		if pos+5 > len(data) {
 			break
 		}
@@ -828,17 +850,17 @@ func ParseSelfMp(data []byte, selfObjId uint32) (mp, maxMp int32, ok bool) {
 	return mp, maxMp, ok
 }
 
-// ParseOwnSkillReuse extracts (skillId, reuseMs) from a MagicSkillUse packet.
-func ParseOwnSkillReuse(data []byte, selfObjId uint32) (skillId uint32, reuseMs int32, ok bool) {
+// ParseOwnSkillReuse extracts (skillID, reuseMs) from a MagicSkillUse packet.
+func ParseOwnSkillReuse(data []byte, selfObjID uint32) (uint32, int32, bool) {
 	if len(data) < 33 || data[0] != OpGSMagicSkillUse {
 		return 0, 0, false
 	}
-	if binary.LittleEndian.Uint32(data[5:9]) != selfObjId {
+	if binary.LittleEndian.Uint32(data[5:9]) != selfObjID {
 		return 0, 0, false
 	}
-	skillId = binary.LittleEndian.Uint32(data[13:17])
-	reuseMs = int32(binary.LittleEndian.Uint32(data[29:33]))
-	return skillId, reuseMs, true
+	skillID := binary.LittleEndian.Uint32(data[13:17])
+	reuseMs := int32(binary.LittleEndian.Uint32(data[29:33]))
+	return skillID, reuseMs, true
 }
 
 // EncodeGSAppearingTo writes opcode only.
